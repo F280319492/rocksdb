@@ -105,6 +105,9 @@ struct IndexValue {
                     const BlockHandle* previous_handle);
 
   std::string ToString(bool hex, bool have_first_key) const;
+  bool operator<(const IndexValue &b)const {
+    return first_internal_key.compare(b);
+  }
 };
 
 inline uint32_t GetCompressFormatForVersion(CompressionType compression_type,

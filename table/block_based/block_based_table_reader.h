@@ -420,6 +420,10 @@ class BlockBasedTable : public TableReader {
       const BlockBasedTableOptions& table_options, const int level,
       BlockCacheLookupContext* lookup_context);
 
+  Status LoadAllDataBlocks(const ReadOptions& ro,
+      const SliceTransform* prefix_extractor,
+      BlockCacheLookupContext* lookup_context)
+
   static BlockType GetBlockTypeForMetaBlockByName(const Slice& meta_block_name);
 
   Status VerifyChecksumInMetaBlocks(InternalIteratorBase<Slice>* index_iter);
@@ -520,6 +524,10 @@ struct BlockBasedTable::Rep {
   FilterType filter_type;
   BlockHandle filter_handle;
   BlockHandle compression_dict_handle;
+
+  bool is_data_block_loaded;
+  std:map<IndexValue, Block*> data_blocks;
+  //std::vector<Block*> data_blocks;
 
   std::shared_ptr<const TableProperties> table_properties;
   BlockBasedTableOptions::IndexType index_type;
