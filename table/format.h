@@ -106,7 +106,7 @@ struct IndexValue {
 
   std::string ToString(bool hex, bool have_first_key) const;
   bool operator<(const IndexValue &b)const {
-    return first_internal_key.compare(b);
+    return first_internal_key.compare(b.first_internal_key);
   }
 };
 

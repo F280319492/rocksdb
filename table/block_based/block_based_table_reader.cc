@@ -1198,6 +1198,14 @@ Status BlockBasedTable::Open(
       prefetch_buffer.get(), meta_iter.get(), new_table.get(), prefetch_all,
       table_options, level, &lookup_context);
 
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Load all the data block to the table reader
+  s = new_table->LoadAllDataBlocks(ReadOptions(), prefix_extractor,
+      &lookup_context, file_size);
+
   if (s.ok()) {
     // Update tail prefetch stats
     assert(prefetch_buffer.get() != nullptr);
@@ -1208,9 +1216,6 @@ Status BlockBasedTable::Open(
     }
     *table_reader = std::move(new_table);
   }
-
-  // Load all the data block to the table reader
-  s = new_table->LoadAllDataBlocks(ReadOptions(), prefix_extractor, &lookup_context);
 
   return s;
 }
@@ -1575,8 +1580,12 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
 
 Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
     const SliceTransform* prefix_extractor,
-    BlockCacheLookupContext* lookup_context) {
+    BlockCacheLookupContext* lookup_context, uint64_t file_size) {
   Status s;
+  std::unique_ptr<FilePrefetchBuffer> prefetch_buffer;
+  size_t prefetch_off = 0;
+  size_t prefetch_len;
+
   rep_->is_data_block_loaded = false;
 
   IndexBlockIter iiter_on_stack;
@@ -1587,10 +1596,28 @@ Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
   }
   auto iiter =
         NewIndexIterator(ro, need_upper_bound_check, &iiter_on_stack,
-                         /*get_context*/ nullptr, &lookup_context);
+                         /*get_context*/ nullptr, lookup_context);
+  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
   if (iiter != &iiter_on_stack) {
     iiter_unique_ptr.reset(iiter);
   }
+
+  //prefetch the data blocks into FilePrefetchBuffer
+  iiter->SeekToLast();
+  prefetch_len = iiter->value().handle.offset() + iiter->value().handle.size();
+  prefetch_len = prefetch_len <= file_size ? prefetch_len : file_size;
+  RandomAccessFileReader* file = rep_->file.get();
+  if (!file->use_direct_io()) {
+    prefetch_buffer.reset(new FilePrefetchBuffer(nullptr, 0, 0, false, true));
+    s = file->Prefetch(prefetch_off, prefetch_len);
+  } else {
+    prefetch_buffer.reset(new FilePrefetchBuffer(nullptr, 0, 0, true, true));
+    s = prefetch_buffer->Prefetch(file, prefetch_off, prefetch_len);
+  }
+  if(!s.ok()) {
+    return s;
+  }
+
   for (iiter->SeekToFirst(); iiter->Valid(); iiter->Next()) {
     IndexValue v = iiter->value();
 
@@ -1598,7 +1625,7 @@ Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
     if (rep_->uncompression_dict_reader) {
       const bool no_io = (ro.read_tier == kBlockCacheTier);
       s = rep_->uncompression_dict_reader->GetOrReadUncompressionDictionary(
-          prefetch_buffer, no_io, /*get_context*/nullptr, lookup_context,
+          /*prefetch_buffer*/nullptr, no_io, /*get_context*/nullptr, lookup_context,
           &uncompression_dict);
       if (!s.ok()) {
         return s;
@@ -1615,7 +1642,7 @@ Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
       StopWatch sw(rep_->ioptions.env, rep_->ioptions.statistics,
                  READ_BLOCK_GET_MICROS);
       s = ReadBlockFromFile(
-        rep_->file.get(), /*prefetch_buffer*/nullptr, rep_->footer, ro, v.handle, &block,
+        rep_->file.get(), prefetch_buffer.get(), rep_->footer, ro, v.handle, &block,
         rep_->ioptions, do_uncompress, do_uncompress, BlockType::kData,
         dict, rep_->persistent_cache_options,
         rep_->get_global_seqno(BlockType::kData),
@@ -1630,9 +1657,10 @@ Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
         return s;
       }
 
-      rep_->data_blocks->insert(pairs<Slice, Block*>(v, block.release()));
+      rep_->data_blocks.insert(pair<Slice, Block*>(v, block.release()));
 
     }
+  }
   rep_->is_data_block_loaded = true;
   return s;
 }
@@ -3285,9 +3313,9 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     bool done = false;
 
     if(rep_->is_data_block_loaded) {
-      auto it = rep_->data_blocks.lower_bound(key);
+      auto it = rep_->data_blocks.lower_bound(IndexValue(BlockHandle(), key));
       it = it == rep_->data_blocks.begin() ? it : it--;
-      for(; it != rep_->data_blocks.end(); it++) {
+      for(; it != rep_->data_blocks.end() && !done; it++) {
         IndexValue v = it->first;
 
         bool not_exist_in_filter =
@@ -3324,7 +3352,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         uint64_t referenced_data_size = 0;
 
         
-        InitBlockIterator<TBlockIter>(rep_, it.second, &biter,
+        InitBlockIterator<DataBlockIter>(rep_, it->second, &biter,
                                             /*block_contents_pinned*/ false);
 
         if (no_io && biter.status().IsIncomplete()) {
@@ -3402,7 +3430,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
           // Avoid the extra Next which is expensive in two-level indexes
           break;
         }
-      }     
+      } 
     } else {
       IndexBlockIter iiter_on_stack;
       // if prefix_extractor found in block differs from options, disable
@@ -3535,15 +3563,15 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
           break;
         }
       }
+      if (s.ok()) {
+        s = iiter->status();
+      }
     }
     
     if (matched && filter != nullptr && !filter->IsBlockBased()) {
       RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_FULL_TRUE_POSITIVE);
       PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
                                 rep_->level);
-    }
-    if (s.ok()) {
-      s = iiter->status();
     }
   }
 

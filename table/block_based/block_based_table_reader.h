@@ -422,7 +422,7 @@ class BlockBasedTable : public TableReader {
 
   Status LoadAllDataBlocks(const ReadOptions& ro,
       const SliceTransform* prefix_extractor,
-      BlockCacheLookupContext* lookup_context)
+      BlockCacheLookupContext* lookup_context);
 
   static BlockType GetBlockTypeForMetaBlockByName(const Slice& meta_block_name);
 
@@ -485,6 +485,7 @@ struct BlockBasedTable::Rep {
         filter_policy(skip_filters ? nullptr : _table_opt.filter_policy.get()),
         internal_comparator(_internal_comparator),
         filter_type(FilterType::kNoFilter),
+        is_data_block_loaded(false),
         index_type(BlockBasedTableOptions::IndexType::kBinarySearch),
         hash_index_allow_collision(false),
         whole_key_filtering(_table_opt.whole_key_filtering),
@@ -492,6 +493,12 @@ struct BlockBasedTable::Rep {
         global_seqno(kDisableGlobalSequenceNumber),
         level(_level),
         immortal_table(_immortal_table) {}
+  ~Rep() {
+    for(auto it = data_blocks.begin(); it != data_blocks.end(); it++) {
+      delete it->second;
+    }
+    data_blocks.clear();
+  }
 
   const ImmutableCFOptions& ioptions;
   const EnvOptions& env_options;
@@ -526,7 +533,7 @@ struct BlockBasedTable::Rep {
   BlockHandle compression_dict_handle;
 
   bool is_data_block_loaded;
-  std:map<IndexValue, Block*> data_blocks;
+  std::map<IndexValue, Block*> data_blocks;
   //std::vector<Block*> data_blocks;
 
   std::shared_ptr<const TableProperties> table_properties;
