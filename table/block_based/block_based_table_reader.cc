@@ -1657,7 +1657,7 @@ Status BlockBasedTable::LoadAllDataBlocks(const ReadOptions& ro,
         return s;
       }
 
-      rep_->data_blocks.insert(pair<Slice, Block*>(v, block.release()));
+      rep_->data_blocks.insert(std::pair<uint64_t, Block*>(v.handle.offset(), block.release()));
 
     }
   }
@@ -3313,124 +3313,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     bool done = false;
 
     if(rep_->is_data_block_loaded) {
-      auto it = rep_->data_blocks.lower_bound(IndexValue(BlockHandle(), key));
-      it = it == rep_->data_blocks.begin() ? it : it--;
-      for(; it != rep_->data_blocks.end() && !done; it++) {
-        IndexValue v = it->first;
 
-        bool not_exist_in_filter =
-            filter != nullptr && filter->IsBlockBased() == true &&
-            !filter->KeyMayMatch(ExtractUserKeyAndStripTimestamp(key, ts_sz),
-                                prefix_extractor, v.handle.offset(), no_io,
-                                /*const_ikey_ptr=*/nullptr, get_context,
-                                &lookup_context);
-
-        if (not_exist_in_filter) {
-          // Not found
-          // TODO: think about interaction with Merge. If a user key cannot
-          // cross one data block, we should be fine.
-          RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_USEFUL);
-          PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, 1, rep_->level);
-          break;
-        }
-
-        if (!v.first_internal_key.empty() && !skip_filters &&
-            UserComparatorWrapper(rep_->internal_comparator.user_comparator())
-                    .Compare(ExtractUserKey(key),
-                            ExtractUserKey(v.first_internal_key)) < 0) {
-          // The requested key falls between highest key in previous block and
-          // lowest key in current block.
-          break;
-        }
-
-        BlockCacheLookupContext lookup_data_block_context{
-            TableReaderCaller::kUserGet, tracing_get_id,
-            /*get_from_user_specified_snapshot=*/read_options.snapshot !=
-                nullptr};
-        bool does_referenced_key_exist = false;
-        DataBlockIter biter;
-        uint64_t referenced_data_size = 0;
-
-        
-        InitBlockIterator<DataBlockIter>(rep_, it->second, &biter,
-                                            /*block_contents_pinned*/ false);
-
-        if (no_io && biter.status().IsIncomplete()) {
-          // couldn't get block from block_cache
-          // Update Saver.state to Found because we are only looking for
-          // whether we can guarantee the key is not there when "no_io" is set
-          get_context->MarkKeyMayExist();
-          break;
-        }
-        if (!biter.status().ok()) {
-          s = biter.status();
-          break;
-        }
-
-        bool may_exist = biter.SeekForGet(key);
-        // If user-specified timestamp is supported, we cannot end the search
-        // just because hash index lookup indicates the key+ts does not exist.
-        if (!may_exist && ts_sz == 0) {
-          // HashSeek cannot find the key this block and the the iter is not
-          // the end of the block, i.e. cannot be in the following blocks
-          // either. In this case, the seek_key cannot be found, so we break
-          // from the top level for-loop.
-          done = true;
-        } else {
-          // Call the *saver function on each entry/block until it returns false
-          for (; biter.Valid(); biter.Next()) {
-            ParsedInternalKey parsed_key;
-            if (!ParseInternalKey(biter.key(), &parsed_key)) {
-              s = Status::Corruption(Slice());
-            }
-
-            if (!get_context->SaveValue(
-                    parsed_key, biter.value(), &matched,
-                    biter.IsValuePinned() ? &biter : nullptr)) {
-              if (get_context->State() == GetContext::GetState::kFound) {
-                does_referenced_key_exist = true;
-                referenced_data_size = biter.key().size() + biter.value().size();
-              }
-              done = true;
-              break;
-            }
-          }
-          s = biter.status();
-        }
-
-        // Write the block cache access record.
-        if (block_cache_tracer_ && block_cache_tracer_->is_tracing_enabled()) {
-          // Avoid making copy of block_key, cf_name, and referenced_key when
-          // constructing the access record.
-          Slice referenced_key;
-          if (does_referenced_key_exist) {
-            referenced_key = biter.key();
-          } else {
-            referenced_key = key;
-          }
-          BlockCacheTraceRecord access_record(
-              rep_->ioptions.env->NowMicros(),
-              /*block_key=*/"", lookup_data_block_context.block_type,
-              lookup_data_block_context.block_size, rep_->cf_id_for_tracing(),
-              /*cf_name=*/"", rep_->level_for_tracing(),
-              rep_->sst_number_for_tracing(), lookup_data_block_context.caller,
-              lookup_data_block_context.is_cache_hit,
-              lookup_data_block_context.no_insert,
-              lookup_data_block_context.get_id,
-              lookup_data_block_context.get_from_user_specified_snapshot,
-              /*referenced_key=*/"", referenced_data_size,
-              lookup_data_block_context.num_keys_in_block,
-              does_referenced_key_exist);
-          block_cache_tracer_->WriteBlockAccess(
-              access_record, lookup_data_block_context.block_key,
-              rep_->cf_name_for_tracing(), referenced_key);
-        }
-
-        if (done) {
-          // Avoid the extra Next which is expensive in two-level indexes
-          break;
-        }
-      } 
     } else {
       IndexBlockIter iiter_on_stack;
       // if prefix_extractor found in block differs from options, disable
@@ -3483,10 +3366,17 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         bool does_referenced_key_exist = false;
         DataBlockIter biter;
         uint64_t referenced_data_size = 0;
-        NewDataBlockIterator<DataBlockIter>(
-            read_options, v.handle, &biter, BlockType::kData, get_context,
-            &lookup_data_block_context,
-            /*s=*/Status(), /*prefetch_buffer*/ nullptr);
+
+        if(rep_->is_data_block_loaded) {
+          auto it = rep_->data_blocks.find(v.handle.offset());
+          InitBlockIterator<DataBlockIter>(rep_, it->second, &biter,
+                                            /*block_contents_pinned*/ false);
+        } else {
+          NewDataBlockIterator<DataBlockIter>(
+              read_options, v.handle, &biter, BlockType::kData, get_context,
+              &lookup_data_block_context,
+              /*s=*/Status(), /*prefetch_buffer*/ nullptr);
+        }
 
         if (no_io && biter.status().IsIncomplete()) {
           // couldn't get block from block_cache

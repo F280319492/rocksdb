@@ -422,7 +422,8 @@ class BlockBasedTable : public TableReader {
 
   Status LoadAllDataBlocks(const ReadOptions& ro,
       const SliceTransform* prefix_extractor,
-      BlockCacheLookupContext* lookup_context);
+      BlockCacheLookupContext* lookup_context,
+      uint64_t file_size);
 
   static BlockType GetBlockTypeForMetaBlockByName(const Slice& meta_block_name);
 
@@ -533,7 +534,7 @@ struct BlockBasedTable::Rep {
   BlockHandle compression_dict_handle;
 
   bool is_data_block_loaded;
-  std::map<IndexValue, Block*> data_blocks;
+  std::map<uint64_t, Block*> data_blocks;
   //std::vector<Block*> data_blocks;
 
   std::shared_ptr<const TableProperties> table_properties;
