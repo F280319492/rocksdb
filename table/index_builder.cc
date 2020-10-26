@@ -30,8 +30,9 @@ IndexBuilder* IndexBuilder::CreateIndexBuilder(
     const BlockBasedTableOptions& table_opt) {
   switch (index_type) {
     case BlockBasedTableOptions::kBinarySearch: {
-      return new ShortenedIndexBuilder(comparator,
-                                       table_opt.index_block_restart_interval);
+      //return new ShortenedIndexBuilder(comparator,
+      //                                 table_opt.index_block_restart_interval);
+      return new SuTireIndexBuilder(comparator, table_opt.index_block_restart_interval);
     }
     case BlockBasedTableOptions::kHashSearch: {
       return new HashIndexBuilder(comparator, int_key_slice_transform,

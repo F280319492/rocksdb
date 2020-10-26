@@ -20,6 +20,7 @@
 #include "table/block_based_table_factory.h"
 #include "table/block_builder.h"
 #include "table/format.h"
+#include "surf/include/surf.hpp"
 
 namespace rocksdb {
 // The interface for building index.
@@ -150,6 +151,54 @@ class ShortenedIndexBuilder : public IndexBuilder {
 
  private:
   BlockBuilder index_block_builder_;
+};
+
+class SuTireIndexBuilder : public IndexBuilder {
+ public:
+  explicit SuTireIndexBuilder(const InternalKeyComparator* comparator,
+                                 int index_block_restart_interval)
+      : IndexBuilder(comparator) {}
+
+  virtual void AddIndexEntry(std::string* last_key_in_current_block,
+                             const Slice* first_key_in_next_block,
+                             const BlockHandle& block_handle) override {
+    std::string key = *last_key_in_current_block;
+    if (first_key_in_next_block != nullptr) {
+      comparator_->FindShortestSeparator(last_key_in_current_block,
+                                         *first_key_in_next_block);
+    } else {
+      comparator_->FindShortSuccessor(last_key_in_current_block);
+    }
+
+    if(!keys.empty()) {
+        assert(ExtractUserKey(*last_key_in_current_block).ToString() > keys.back());
+    }
+    keys.push_back(ExtractUserKey(*last_key_in_current_block).ToString());
+    suffixs.push_back(DecodeFixed64((*last_key_in_current_block).data() + (*last_key_in_current_block).size() - 8));
+    values.push_back(block_handle.offset() | block_handle.size() << 32);
+  }
+
+  using IndexBuilder::Finish;
+  virtual Status Finish(
+      IndexBlocks* index_blocks,
+      const BlockHandle& /*last_partition_block_handle*/) override {
+    surf::SuRF* surf = new surf::SuRF(keys, suffixs, values, surf::kReal, 0, 64);
+
+    index_blocks->index_block_contents = surf->serialize();
+    delete surf;
+    return Status::OK();
+  }
+
+  virtual size_t EstimatedSize() const override {
+    return -1;
+  }
+
+  friend class PartitionedIndexBuilder;
+
+ private:
+  std::vector<std::string> keys;
+  std::vector<uint64_t> values;
+  std::vector<uint64_t> suffixs;
 };
 
 // HashIndexBuilder contains a binary-searchable primary index and the

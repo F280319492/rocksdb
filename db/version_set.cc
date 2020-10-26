@@ -956,7 +956,6 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   bool* key_exists, SequenceNumber* seq) {
   Slice ikey = k.internal_key();
   Slice user_key = k.user_key();
-
   assert(status->ok() || status->IsMergeInProgress());
 
   if (key_exists != nullptr) {

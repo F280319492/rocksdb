@@ -398,7 +398,7 @@ uint32_t Block::NumRestarts() const {
 }
 
 Block::Block(BlockContents&& contents, SequenceNumber _global_seqno,
-             size_t read_amp_bytes_per_bit, Statistics* statistics)
+             size_t read_amp_bytes_per_bit, Statistics* statistics, bool is_sutire_block)
     : contents_(std::move(contents)),
       data_(contents_.data.data()),
       size_(contents_.data.size()),
@@ -418,48 +418,63 @@ Block::Block(BlockContents&& contents, SequenceNumber _global_seqno,
     read_amp_bitmap_.reset(new BlockReadAmpBitmap(
         restart_offset_, read_amp_bytes_per_bit, statistics));
   }
+  if(is_sutire_block) {
+    assert(size_ >= 5*sizeof(uint32_t));
+    surf_.reset(surf::SuRF::deSerialize(const_cast<char*>(data_)));
+  }
 }
 
-InternalIterator* Block::NewIterator(const Comparator* cmp, BlockIter* iter,
+InternalIterator* Block::NewIterator(const Comparator* cmp, InternalIterator* iter,
                                      bool total_order_seek, Statistics* stats) {
+  BlockIter* ret_iter;
+  if (iter != nullptr) {
+    assert(dynamic_cast<BlockIter*>(iter));
+    ret_iter = dynamic_cast<BlockIter*>(iter);
+  } else {
+    ret_iter = new BlockIter;
+  }
   if (size_ < 2*sizeof(uint32_t)) {
-    if (iter != nullptr) {
-      iter->SetStatus(Status::Corruption("bad block contents"));
-      return iter;
-    } else {
-      return NewErrorInternalIterator(Status::Corruption("bad block contents"));
-    }
+    ret_iter->SetStatus(Status::Corruption("bad block contents"));
+    return ret_iter;
   }
   const uint32_t num_restarts = NumRestarts();
   if (num_restarts == 0) {
-    if (iter != nullptr) {
-      iter->SetStatus(Status::OK());
-      return iter;
-    } else {
-      return NewEmptyInternalIterator();
-    }
+    ret_iter->SetStatus(Status::OK());
+    return ret_iter;
   } else {
     BlockPrefixIndex* prefix_index_ptr =
         total_order_seek ? nullptr : prefix_index_.get();
 
-    if (iter != nullptr) {
-      iter->Initialize(cmp, data_, restart_offset_, num_restarts,
+      ret_iter->Initialize(cmp, data_, restart_offset_, num_restarts,
                        prefix_index_ptr, global_seqno_, read_amp_bitmap_.get());
-    } else {
-      iter = new BlockIter(cmp, data_, restart_offset_, num_restarts,
-                           prefix_index_ptr, global_seqno_,
-                           read_amp_bitmap_.get());
-    }
+  }
 
-    if (read_amp_bitmap_) {
-      if (read_amp_bitmap_->GetStatistics() != stats) {
-        // DB changed the Statistics pointer, we need to notify read_amp_bitmap_
-        read_amp_bitmap_->SetStatistics(stats);
-      }
+  if (read_amp_bitmap_) {
+    if (read_amp_bitmap_->GetStatistics() != stats) {
+      // DB changed the Statistics pointer, we need to notify read_amp_bitmap_
+      read_amp_bitmap_->SetStatistics(stats);
     }
   }
 
-  return iter;
+  return ret_iter;
+}
+
+InternalIterator* Block::NewSuTireIterator(const Comparator* comparator,
+                                    InternalIterator* iter) {
+  SuTireIndexBlockIter* ret_iter;
+  if (iter != nullptr) {
+    assert(dynamic_cast<SuTireIndexBlockIter*>(iter));
+    ret_iter = dynamic_cast<SuTireIndexBlockIter*>(iter);
+  } else {
+    ret_iter = new SuTireIndexBlockIter;
+  }
+  if (size_ < 5*sizeof(uint32_t)) {
+    ret_iter->SetStatus(Status::Corruption("bad block contents"));
+    return ret_iter;
+  }
+  ret_iter->Initialize(comparator, surf_);
+
+  return ret_iter;
 }
 
 void Block::SetBlockPrefixIndex(BlockPrefixIndex* prefix_index) {

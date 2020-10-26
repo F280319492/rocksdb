@@ -63,6 +63,13 @@ else()
     include_directories(${SNAPPY_INCLUDE_DIR})
     list(APPEND THIRDPARTY_LIBS ${SNAPPY_LIBRARIES})
   endif()
+  option(WITH_GFLAGS "build with GFlags" OFF)
+  if(WITH_GFLAGS)
+    find_package(gflags REQUIRED)
+    add_definitions(-DGFLAGS)
+    include_directories(${GFLAGS_INCLUDE_DIR})
+    list(APPEND THIRDPARTY_LIBS ${GFLAGS_LIBRARIES})
+  endif()
 endif()
 
 if(WIN32)
@@ -437,6 +444,14 @@ set(SOURCES
         table/sst_file_writer.cc
         table/table_properties.cc
         table/two_level_iterator.cc
+        table/surf/src/bitvector.cpp
+        table/surf/src/config.cpp
+        table/surf/src/label_vector.cpp
+        table/surf/src/louds_dense.cpp
+        table/surf/src/louds_sparse.cpp
+        table/surf/src/suffix.cpp
+        table/surf/src/surf.cpp
+        table/surf/src/surf_builder.cpp
         tools/db_bench_tool.cc
         tools/dump/db_dump_tool.cc
         tools/ldb_cmd.cc

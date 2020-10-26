@@ -35,6 +35,7 @@ namespace rocksdb {
 
 class Block;
 class BlockIter;
+class SuTireIndexBlockIter;
 class BlockHandle;
 class Cache;
 class FilterBlockReader;
@@ -166,7 +167,7 @@ class BlockBasedTable : public TableReader {
     // to
     // a different object then iter and the callee has the ownership of the
     // returned object.
-    virtual InternalIterator* NewIterator(BlockIter* iter = nullptr,
+    virtual InternalIterator* NewIterator(InternalIterator* iter = nullptr,
                                           bool total_order_seek = true) = 0;
 
     // The size of the index.
@@ -251,7 +252,7 @@ class BlockBasedTable : public TableReader {
   //  3. We disallowed any io to be performed, that is, read_options ==
   //     kBlockCacheTier
   InternalIterator* NewIndexIterator(
-      const ReadOptions& read_options, BlockIter* input_iter = nullptr,
+      const ReadOptions& read_options, InternalIterator* input_iter = nullptr,
       CachableEntry<IndexReader>* index_entry = nullptr);
 
   // Read block cache from block caches (if set): block_cache and

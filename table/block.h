@@ -30,12 +30,14 @@
 #include "util/random.h"
 #include "util/sync_point.h"
 #include "format.h"
+#include "surf/include/surf.hpp"
 
 namespace rocksdb {
 
 struct BlockContents;
 class Comparator;
 class BlockIter;
+class SuTireIndexBlockIter;
 class BlockPrefixIndex;
 
 // BlockReadAmpBitmap is a bitmap that map the rocksdb::Block data bytes to
@@ -136,7 +138,8 @@ class Block {
   // Initialize the block with the specified contents.
   explicit Block(BlockContents&& contents, SequenceNumber _global_seqno,
                  size_t read_amp_bytes_per_bit = 0,
-                 Statistics* statistics = nullptr);
+                 Statistics* statistics = nullptr,
+                 bool is_sutire_block = false);
 
   ~Block() = default;
 
@@ -170,9 +173,12 @@ class Block {
   // This option only applies for index block. For data block, hash_index_
   // and prefix_index_ are null, so this option does not matter.
   InternalIterator* NewIterator(const Comparator* comparator,
-                                BlockIter* iter = nullptr,
+                                InternalIterator* iter = nullptr,
                                 bool total_order_seek = true,
                                 Statistics* stats = nullptr);
+  InternalIterator* NewSuTireIterator(const Comparator* comparator,
+                                InternalIterator* iter = nullptr);
+
   void SetBlockPrefixIndex(BlockPrefixIndex* prefix_index);
 
   // Report an approximation of how much memory has been used.
@@ -190,10 +196,111 @@ class Block {
   // All keys in the block will have seqno = global_seqno_, regardless of
   // the encoded value (kDisableGlobalSequenceNumber means disabled)
   const SequenceNumber global_seqno_;
+  std::shared_ptr<surf::SuRF> surf_;
 
   // No copying allowed
   Block(const Block&);
   void operator=(const Block&);
+};
+
+class SuTireIndexBlockIter final : public InternalIterator {
+ public:
+  SuTireIndexBlockIter()
+    : comparator_(nullptr),
+      status_(Status::OK()),
+      surf_(nullptr) {}
+  SuTireIndexBlockIter(const Comparator* comparator, std::shared_ptr<surf::SuRF> surf)
+      : SuTireIndexBlockIter() {
+    Initialize(comparator, surf);
+  }
+
+  void Initialize(const Comparator* comparator, std::shared_ptr<surf::SuRF> surf) {
+    assert(surf_ == nullptr);           // Ensure it is called only once
+    comparator_ = comparator;
+    surf_ = surf;
+  }
+
+  virtual bool Valid() const override { /*TODO*/return surf_iter_.isValid(); }
+  virtual Status status() const override { return status_; }
+  virtual Slice key() const override {
+    assert(Valid());
+    std::string iter_key = surf_iter_.getKey();
+    return Slice(iter_key);
+  }
+
+  virtual Slice value() const override {
+    uint64_t suffix;
+    std::string val;
+    surf_iter_.getValue(&suffix);
+    PutVarint64(&val, suffix & 0xFFFFFFFF);
+    PutVarint64(&val, (suffix >> 32) & 0xFFFFFFFF);
+    return Slice(val);
+  }
+
+  void SetStatus(Status s) override {
+    status_ = s;
+  }
+
+  virtual void Next() override {
+    assert(Valid());
+    surf_iter_++;
+  }
+
+  virtual void Prev() override {
+    assert(Valid());
+    surf_iter_--;
+  }
+
+  virtual void Seek(const Slice& target) override {
+    if (surf_ == nullptr) {  // Not init yet
+      return;
+    }
+    std::string user_key_target = ExtractUserKey(target).ToString();
+    uint64_t suffix_target = DecodeFixed64((target.data() + target.size() - 8));
+    surf_iter_.clear();
+    surf_iter_ = surf_->moveToKeyGreaterThan(user_key_target, true);
+    if(surf_iter_.isValid()) {
+      std::string user_key = surf_iter_.getKey();
+      uint64_t suffix;
+      surf_iter_.getSuffix(&suffix);
+      if(user_key < user_key_target || (user_key == user_key_target && suffix > suffix_target)) {
+        Next();
+      }
+    }
+  }
+
+  virtual void SeekForPrev(const Slice& target) override {
+    if (surf_ == nullptr) {  // Not init yet
+      return;
+    }
+    surf_iter_.clear();
+    surf_iter_ = surf_->moveToKeyLessThan(target.ToString(), true);
+    if(surf_iter_.isValid() && Slice(surf_iter_.getKey()).compare(target) > 0) {
+      Prev();
+    }
+  }
+
+  virtual void SeekToFirst() override {
+    if (surf_ == nullptr) {  // Not init yet
+      return;
+    }
+    surf_iter_.clear();
+    surf_iter_ = surf_->moveToFirst();
+  }
+
+  virtual void SeekToLast() override {
+    if (surf_ == nullptr) {  // Not init yet
+      return;
+    }
+    surf_iter_.clear();
+    surf_iter_ = surf_->moveToLast();
+  }
+
+ private:
+  const Comparator* comparator_;
+  Status status_;
+  std::shared_ptr<surf::SuRF> surf_;
+  surf::SuRF::Iter surf_iter_;
 };
 
 class BlockIter : public InternalIterator {
@@ -239,7 +346,7 @@ class BlockIter : public InternalIterator {
     last_bitmap_offset_ = current_ + 1;
   }
 
-  void SetStatus(Status s) {
+  void SetStatus(Status s) override {
     status_ = s;
   }
 

@@ -77,13 +77,14 @@ Status ReadBlockFromFile(RandomAccessFileReader* file, const Footer& footer,
                          const Slice& compression_dict,
                          const PersistentCacheOptions& cache_options,
                          SequenceNumber global_seqno,
-                         size_t read_amp_bytes_per_bit) {
+                         size_t read_amp_bytes_per_bit,
+                         bool is_sutire_block = false) {
   BlockContents contents;
   Status s = ReadBlockContents(file, footer, options, handle, &contents, ioptions,
                                do_uncompress, compression_dict, cache_options);
   if (s.ok()) {
     result->reset(new Block(std::move(contents), global_seqno,
-                            read_amp_bytes_per_bit, ioptions.statistics));
+                            read_amp_bytes_per_bit, ioptions.statistics, is_sutire_block));
   }
 
   return s;
@@ -179,7 +180,7 @@ class PartitionIndexReader : public IndexReader, public Cleanable {
   }
 
   // return a two-level iterator: first level is on the partition index
-  virtual InternalIterator* NewIterator(BlockIter* iter = nullptr,
+  virtual InternalIterator* NewIterator(InternalIterator* iter = nullptr,
                                         bool dont_care = true) override {
     // Filters are already checked before seeking the index
     const bool skip_filters = true;
@@ -258,7 +259,7 @@ class BinarySearchIndexReader : public IndexReader {
     return s;
   }
 
-  virtual InternalIterator* NewIterator(BlockIter* iter = nullptr,
+  virtual InternalIterator* NewIterator(InternalIterator* iter = nullptr,
                                         bool dont_care = true) override {
     return index_block_->NewIterator(icomparator_, iter, true);
   }
@@ -280,6 +281,62 @@ class BinarySearchIndexReader : public IndexReader {
       : IndexReader(icomparator, stats), index_block_(std::move(index_block)) {
     assert(index_block_ != nullptr);
   }
+  std::unique_ptr<Block> index_block_;
+};
+
+class SuTireIndexReader : public IndexReader {
+ public:
+  // Read index from the file and create an intance for
+  // `BinarySearchIndexReader`.
+  // On success, index_reader will be populated; otherwise it will remain
+  // unmodified.
+  static Status Create(RandomAccessFileReader* file, const Footer& footer,
+                       const BlockHandle& index_handle,
+                       const ImmutableCFOptions& ioptions,
+                       const InternalKeyComparator* icomparator,
+                       IndexReader** index_reader,
+                       const PersistentCacheOptions& cache_options) {
+    std::unique_ptr<Block> index_block;
+    //std::cout << "Open File: " << index_handle.offset() << " " << index_handle.size() << std::endl;
+    auto s = ReadBlockFromFile(
+        file, footer, ReadOptions(), index_handle, &index_block, ioptions,
+        true /* decompress */, Slice() /*compression dict*/, cache_options,
+        kDisableGlobalSequenceNumber, 0 /* read_amp_bytes_per_bit */, true);
+
+    if (s.ok()) {
+      *index_reader = new SuTireIndexReader(
+          icomparator, std::move(index_block), ioptions.statistics);
+    }
+
+    return s;
+  }
+
+  virtual InternalIterator* NewIterator(InternalIterator* iter = nullptr,
+                                        bool dont_care = true) override {
+    return index_block_->NewSuTireIterator(icomparator_, iter);
+  }
+
+  virtual size_t size() const override { return index_block_->size(); }
+  virtual size_t usable_size() const override {
+    return index_block_->usable_size();
+  }
+  virtual size_t ApproximateMemoryUsage() const override {
+    assert(index_block_);
+    return index_block_->ApproximateMemoryUsage();
+  }
+
+ private:
+  SuTireIndexReader(const InternalKeyComparator* icomparator,
+                          std::unique_ptr<Block>&& index_block,
+                          Statistics* stats)
+      : IndexReader(icomparator, stats), index_block_(std::move(index_block)) {
+    assert(index_block_ != nullptr);
+    surf = surf::SuRF::deSerialize(const_cast<char*>(index_block_->data()));
+  }
+  ~SuTireIndexReader() {
+    delete surf;
+  }
+  surf::SuRF* surf;
   std::unique_ptr<Block> index_block_;
 };
 
@@ -361,7 +418,7 @@ class HashIndexReader : public IndexReader {
     return Status::OK();
   }
 
-  virtual InternalIterator* NewIterator(BlockIter* iter = nullptr,
+  virtual InternalIterator* NewIterator(InternalIterator* iter = nullptr,
                                         bool total_order_seek = true) override {
     return index_block_->NewIterator(icomparator_, iter, total_order_seek);
   }
@@ -1153,7 +1210,7 @@ BlockBasedTable::CachableEntry<FilterBlockReader> BlockBasedTable::GetFilter(
 }
 
 InternalIterator* BlockBasedTable::NewIndexIterator(
-    const ReadOptions& read_options, BlockIter* input_iter,
+    const ReadOptions& read_options, InternalIterator* input_iter,
     CachableEntry<IndexReader>* index_entry) {
   // index reader has already been pre-populated.
   if (rep_->index_reader) {
@@ -1622,7 +1679,8 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
   if (!FullFilterKeyMayMatch(read_options, filter, key, no_io)) {
     RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_USEFUL);
   } else {
-    BlockIter iiter_on_stack;
+    //BlockIter iiter_on_stack;
+    SuTireIndexBlockIter iiter_on_stack;
     auto iiter = NewIndexIterator(read_options, &iiter_on_stack);
     std::unique_ptr<InternalIterator> iiter_unique_ptr;
     if (iiter != &iiter_on_stack) {
@@ -1819,7 +1877,8 @@ Status BlockBasedTable::CreateIndexReader(
           icomparator, index_reader, rep_->persistent_cache_options, level);
     }
     case BlockBasedTableOptions::kBinarySearch: {
-      return BinarySearchIndexReader::Create(
+      return SuTireIndexReader::Create(
+      //return BinarySearchIndexReader::Create(
           file, footer, footer.index_handle(), rep_->ioptions, icomparator,
           index_reader, rep_->persistent_cache_options);
     }
