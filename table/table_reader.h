@@ -81,6 +81,11 @@ class TableReader {
   virtual Status Get(const ReadOptions& readOptions, const Slice& key,
                      GetContext* get_context, bool skip_filters = false) = 0;
 
+  virtual Status Get1(const ReadOptions& readOptions, const Slice& key,
+                   std::shared_ptr<GetContext> get_context, Context* ctx,
+                   bool skip_filters = false) {
+    return Status::NotSupported();
+  }
   // Prefetch data corresponding to a give range of keys
   // Typically this functionality is required for table implementations that
   // persists the data on a non volatile storage medium like disk/SSD

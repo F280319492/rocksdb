@@ -22,6 +22,7 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
+#include "rocksdb/Context.h"
 #include "table/filter_block.h"
 #include "table/format.h"
 #include "table/persistent_cache_helper.h"
@@ -109,6 +110,9 @@ class BlockBasedTable : public TableReader {
   // @param skip_filters Disables loading/accessing the filter block
   Status Get(const ReadOptions& readOptions, const Slice& key,
              GetContext* get_context, bool skip_filters = false) override;
+  Status Get1(const ReadOptions& readOptions, const Slice& key,            
+             std::shared_ptr<GetContext> get_context, Context* ctx,
+             bool skip_filters = false) override;
 
   // Pre-fetch the disk blocks that correspond to the key range specified by
   // (kbegin, kend). The call will return error status in the event of
@@ -145,6 +149,7 @@ class BlockBasedTable : public TableReader {
   bool TEST_filter_block_preloaded() const;
   bool TEST_index_reader_preloaded() const;
 
+  struct C_SST_RW_OnFinish;
   // IndexReader is the interface that provide the functionality for index
   // access.
   class IndexReader {
@@ -217,6 +222,18 @@ class BlockBasedTable : public TableReader {
                                                 BlockIter* input_iter = nullptr,
                                                 bool is_index = false,
                                                 Status s = Status());
+  static InternalIterator* NewDataBlockIterator(Rep* rep, const ReadOptions& ro,
+                                                const Slice& index_value,
+                                                Context* ctx,
+                                                BlockIter* input_iter = nullptr,
+                                                bool is_index = false);
+  static InternalIterator* NewDataBlockIterator(Rep* rep, const ReadOptions& ro,
+                                                const BlockHandle& block_hanlde,
+                                                Context* ctx,
+                                                BlockIter* input_iter = nullptr,  
+                                                bool is_index = false,
+                                                Status s = Status());
+
   // If block cache enabled (compressed or uncompressed), looks for the block
   // identified by handle in (1) uncompressed cache, (2) compressed cache, and
   // then (3) file. If found, inserts into the cache(s) that were searched

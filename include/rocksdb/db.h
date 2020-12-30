@@ -26,6 +26,7 @@
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
 #include "rocksdb/version.h"
+#include "rocksdb/Context.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -298,6 +299,15 @@ class DB {
   virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) {
     return Get(options, DefaultColumnFamily(), key, value);
   }
+
+  virtual Status Get(const ReadOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& key,
+                     PinnableSlice* value, Context* ctx) {return Status::NotSupported("not supported");}
+  virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value, 
+                     Context* ctx) {
+    return Get(options, DefaultColumnFamily(), key, value);
+  }
+
 
   // If keys[i] does not exist in the database, then the i'th returned
   // status will be one for which Status::IsNotFound() is true, and

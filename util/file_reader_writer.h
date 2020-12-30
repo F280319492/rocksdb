@@ -11,6 +11,7 @@
 #include <string>
 #include "port/port.h"
 #include "rocksdb/env.h"
+#include "rocksdb/Context.h"
 #include "util/aligned_buffer.h"
 
 namespace rocksdb {
@@ -63,6 +64,7 @@ class RandomAccessFileReader {
   HistogramImpl*  file_read_hist_;
 
  public:
+  struct C_F_RW_OnFinish;
   explicit RandomAccessFileReader(std::unique_ptr<RandomAccessFile>&& raf,
                                   Env* env = nullptr,
                                   Statistics* stats = nullptr,
@@ -91,6 +93,7 @@ class RandomAccessFileReader {
   RandomAccessFileReader& operator=(const RandomAccessFileReader&) = delete;
 
   Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const;
+  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch, Context* ctx) const;
 
   Status Prefetch(uint64_t offset, size_t n) const {
     return file_->Prefetch(offset, n);

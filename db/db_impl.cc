@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "rocksdb/env.h"
 #include "db/builder.h"
 #include "db/compaction_job.h"
 #include "db/db_info_dumper.h"
@@ -67,6 +68,7 @@
 #include "options/options_parser.h"
 #include "port/likely.h"
 #include "port/port.h"
+#include "rocksdb/Context.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/db.h"
@@ -102,7 +104,8 @@
 namespace rocksdb {
 const std::string kDefaultColumnFamilyName("default");
 void DumpRocksDBBuildVersion(Logger * log);
-
+bool myprint::print_init = false;
+Logger* myprint::print_info_log = nullptr;
 CompressionType GetCompressionFlush(
     const ImmutableCFOptions& ioptions,
     const MutableCFOptions& mutable_cf_options) {
@@ -899,10 +902,51 @@ ColumnFamilyHandle* DBImpl::DefaultColumnFamily() const {
   return default_cf_handle_;
 }
 
+struct DBImpl::C_DBImpl_RW_OnFinish : Context {
+  DBImpl* db;
+  ColumnFamilyData* cfd;
+  SuperVersion* sv;
+  PinnableSlice* pinnable_val;
+  std::shared_ptr<LookupKey> lkey;
+  std::shared_ptr<RangeDelAggregator> range_del_agg;
+
+  Context* ctx;
+  C_DBImpl_RW_OnFinish(DBImpl* db_, ColumnFamilyData* cfd_,
+                       SuperVersion* sv_, PinnableSlice* value_,
+                       std::shared_ptr<LookupKey> lkey_, 
+                       std::shared_ptr<RangeDelAggregator> agg_,
+                       Context* ctx_) :
+                    db(db_), cfd(cfd_), sv(sv_), pinnable_val(value_),
+                    lkey(lkey_), range_del_agg(agg_) , ctx(ctx_){}
+  void finish(Status status) override {
+    PERF_TIMER_GUARD(get_post_process_time);
+
+    //ROCKS_LOG_INFO(db->immutable_db_options_.info_log, "C_DBImpl_RW_OnFinish %p", this); 
+    if(status.IsNotFound()) {
+      ROCKS_LOG_INFO(db->immutable_db_options_.info_log, "C_DBImpl_RW_OnFinish %s",
+                     lkey->user_key().ToString(true).c_str());
+    }
+    db->ReturnAndCleanupSuperVersion(cfd, sv);
+
+    RecordTick(db->stats_, NUMBER_KEYS_READ);
+    size_t size = pinnable_val->size();
+    RecordTick(db->stats_, BYTES_READ, size);
+    MeasureTime(db->stats_, BYTES_PER_READ, size);
+
+    ctx->complete(status);
+  }
+};
+
 Status DBImpl::Get(const ReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value) {
   return GetImpl(read_options, column_family, key, value);
+}
+
+Status DBImpl::Get(const ReadOptions& read_options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   PinnableSlice* value, Context* ctx) {
+  return GetImpl(read_options, column_family, key, value, ctx);
 }
 
 Status DBImpl::GetImpl(const ReadOptions& read_options,
@@ -989,6 +1033,107 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
     RecordTick(stats_, BYTES_READ, size);
     MeasureTime(stats_, BYTES_PER_READ, size);
   }
+  return s;
+}
+
+Status DBImpl::GetImpl(const ReadOptions& read_options,
+                       ColumnFamilyHandle* column_family, const Slice& key,
+                       PinnableSlice* pinnable_val, Context* ctx, bool* value_found) {     
+  assert(pinnable_val != nullptr);
+  StopWatch sw(env_, stats_, DB_GET);
+  PERF_TIMER_GUARD(get_snapshot_time);
+
+  auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
+  auto cfd = cfh->cfd();
+
+  // Acquire SuperVersion
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+
+  TEST_SYNC_POINT("DBImpl::GetImpl:1");
+  TEST_SYNC_POINT("DBImpl::GetImpl:2");
+
+  SequenceNumber snapshot;
+  if (read_options.snapshot != nullptr) {
+    snapshot = reinterpret_cast<const SnapshotImpl*>(
+        read_options.snapshot)->number_;
+  } else {
+    // Since we get and reference the super version before getting
+    // the snapshot number, without a mutex protection, it is possible
+    // that a memtable switch happened in the middle and not all the
+    // data for this snapshot is available. But it will contain all
+    // the data available in the super version we have, which is also
+    // a valid snapshot to read from.
+    // We shouldn't get snapshot before finding and referencing the
+    // super versipon because a flush happening in between may compact
+    // away data for the snapshot, but the snapshot is earlier than the
+    // data overwriting it, so users may see wrong results.
+    snapshot = versions_->LastSequence();
+  }
+  TEST_SYNC_POINT("DBImpl::GetImpl:3");
+  TEST_SYNC_POINT("DBImpl::GetImpl:4");
+
+  // Prepare to store a list of merge operations if merge occurs.
+  MergeContext merge_context;
+  std::shared_ptr<RangeDelAggregator> range_del_agg(new RangeDelAggregator(cfd->internal_comparator(), snapshot));
+
+  Status s;
+  // First look in the memtable, then in the immutable memtable (if any).
+  // s is both in/out. When in, s could either be OK or MergeInProgress.
+  // merge_operands will contain the sequence of merges in the latter case.
+  std::shared_ptr<LookupKey> lkey(new LookupKey(key, snapshot));
+  PERF_TIMER_STOP(get_snapshot_time);
+
+  bool skip_memtable = (read_options.read_tier == kPersistedTier &&
+                        has_unpersisted_data_.load(std::memory_order_relaxed));
+  bool done = false;
+  if (!skip_memtable) {
+    if (sv->mem->Get(*lkey, pinnable_val->GetSelf(), &s, &merge_context,
+                     range_del_agg.get(), read_options)) {
+      done = true;
+      pinnable_val->PinSelf();
+      RecordTick(stats_, MEMTABLE_HIT);
+    } else if ((s.ok() || s.IsMergeInProgress()) &&
+               sv->imm->Get(*lkey, pinnable_val->GetSelf(), &s, &merge_context,
+                            range_del_agg.get(), read_options)) {
+      done = true;
+      pinnable_val->PinSelf();
+      RecordTick(stats_, MEMTABLE_HIT);
+    }
+    if (!done && !s.ok() && !s.IsMergeInProgress()) {
+      return s;
+    }
+  }
+  if(!done) {
+    PERF_TIMER_GUARD(get_from_output_files_time);
+    if(!myprint::print_init) {
+      myprint::print_info_log = immutable_db_options_.info_log.get();
+      myprint::print_init = true;
+    }
+    C_DBImpl_RW_OnFinish* db_ctx = new C_DBImpl_RW_OnFinish(this, cfd, sv, 
+                                                            pinnable_val, lkey, range_del_agg, ctx);
+    sv->current->Get(read_options, lkey, pinnable_val, &s, &merge_context,
+                     range_del_agg, db_ctx, value_found);
+    RecordTick(stats_, MEMTABLE_MISS);
+    if(s.IsAsyncRead()) {
+      //ROCKS_LOG_INFO(immutable_db_options_.info_log, "GetImpl %p", db_ctx);
+      return s;
+    } else {
+      db_ctx->ctx = nullptr;
+      delete db_ctx;
+    }
+  }
+  
+  {
+    PERF_TIMER_GUARD(get_post_process_time);
+
+    ReturnAndCleanupSuperVersion(cfd, sv);
+
+    RecordTick(stats_, NUMBER_KEYS_READ);
+    size_t size = pinnable_val->size();
+    RecordTick(stats_, BYTES_READ, size);
+    MeasureTime(stats_, BYTES_PER_READ, size);
+  }
+
   return s;
 }
 

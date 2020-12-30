@@ -218,6 +218,12 @@ extern Status ReadBlockContents(
     BlockContents* contents, const ImmutableCFOptions &ioptions,
     bool do_uncompress = true, const Slice& compression_dict = Slice(),
     const PersistentCacheOptions& cache_options = PersistentCacheOptions());
+extern Status ReadBlockContents(
+    RandomAccessFileReader* file, const Footer& footer,
+    const ReadOptions& options, Context* ctx, 
+    const BlockHandle& handle,
+    BlockContents* contents, const ImmutableCFOptions &ioptions,
+    bool do_uncompress = true, const Slice& compression_dict = Slice());
 
 // The 'data' points to the raw block contents read in from file.
 // This method allocates a new heap buffer and the raw block

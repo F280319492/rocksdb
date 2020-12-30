@@ -359,6 +359,58 @@ Status TableCache::Get(const ReadOptions& options,
   return s;
 }
 
+Status TableCache::Get(const ReadOptions& options,
+                       const InternalKeyComparator& internal_comparator,
+                       const FileDescriptor& fd, const Slice& k,
+                       std::shared_ptr<GetContext> get_context, Context* ctx,
+                       HistogramImpl* file_read_hist,
+                       bool skip_filters, int level) {
+  Status s;
+  TableReader* t = fd.table_reader;
+  Cache::Handle* handle = nullptr;
+  if (t == nullptr) {
+    s = FindTable(env_options_, internal_comparator, fd, &handle,
+                  options.read_tier == kBlockCacheTier /* no_io */,
+                  true /* record_read_stats */, file_read_hist, skip_filters,
+                  level);
+    if (s.ok()) {
+      t = GetTableReaderFromHandle(handle);
+    }
+  }
+  if (s.ok() && get_context->range_del_agg() != nullptr &&
+      !options.ignore_range_deletions) {
+    std::unique_ptr<InternalIterator> range_del_iter(
+        t->NewRangeTombstoneIterator(options));
+    if (range_del_iter != nullptr) {
+      s = range_del_iter->status();
+    }
+    if (s.ok()) {
+      s = get_context->range_del_agg()->AddTombstones(
+          std::move(range_del_iter));
+    }
+  }
+  if (s.ok()) {
+    get_context->SetReplayLog(nullptr);  // nullptr if no cache.
+    s = t->Get1(options, k, get_context, ctx, skip_filters);
+    get_context->SetReplayLog(nullptr);
+    if(s.IsAsyncRead()) {
+      if (handle != nullptr) {
+        ReleaseHandle(handle);
+      }
+      return s;
+    }
+  } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
+    // Couldn't find Table in cache but treat as kFound if no_io set
+    get_context->MarkKeyMayExist();
+    s = Status::OK();
+  }
+
+  if (handle != nullptr) {
+    ReleaseHandle(handle);
+  }
+  return s;
+}
+
 Status TableCache::GetTableProperties(
     const EnvOptions& env_options,
     const InternalKeyComparator& internal_comparator, const FileDescriptor& fd,

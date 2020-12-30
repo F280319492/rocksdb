@@ -63,11 +63,13 @@ struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
 
+
 class DBImpl : public DB {
  public:
   DBImpl(const DBOptions& options, const std::string& dbname);
   virtual ~DBImpl();
 
+  class C_DBImpl_RW_OnFinish;
   // Implementations of the DB interface
   using DB::Put;
   virtual Status Put(const WriteOptions& options,
@@ -93,6 +95,10 @@ class DBImpl : public DB {
   virtual Status Get(const ReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      PinnableSlice* value) override;
+  virtual Status Get(const ReadOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& key,
+                     PinnableSlice* value, Context* ctx) override;
+
   using DB::MultiGet;
   virtual std::vector<Status> MultiGet(
       const ReadOptions& options,
@@ -552,7 +558,7 @@ class DBImpl : public DB {
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is held
   Status WriteOptionsFile();
-
+  
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is NOT held
@@ -1132,6 +1138,10 @@ class DBImpl : public DB {
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value,
                  bool* value_found = nullptr);
+  Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
+                 const Slice& key, PinnableSlice* value,
+                 Context* ctx, bool* value_found = nullptr);
+
 
   bool GetIntPropertyInternal(ColumnFamilyData* cfd,
                               const DBPropertyInfo& property_info,

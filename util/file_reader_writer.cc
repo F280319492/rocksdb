@@ -12,12 +12,15 @@
 #include <algorithm>
 #include <mutex>
 
+#include "monitoring/perf_context_imp.h"
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
 #include "util/random.h"
 #include "util/rate_limiter.h"
 #include "util/sync_point.h"
+#include "rocksdb/Context.h"
+#include "table/format.h"
 
 namespace rocksdb {
 
@@ -59,6 +62,64 @@ Status SequentialFileReader::Skip(uint64_t n) {
   }
 #endif  // !ROCKSDB_LITE
   return file_->Skip(n);
+}
+
+struct RandomAccessFileReader::C_F_RW_OnFinish : Context {
+  AlignedBuffer aligned_buf;
+  Slice tmp;
+  char* buf; //buf
+  Slice* contents; //contents
+  size_t offset_advance;
+  size_t len;
+
+  Context *block_context;
+  Env* env;
+  bool is_enqueue;
+
+  C_F_RW_OnFinish(char* buf_, Slice* contents_, size_t off_,
+                  size_t len_, Context *block_context_, Env* env_) : 
+            buf(buf_), contents(contents_), offset_advance(off_),
+            len(len_), block_context(block_context_), env(env_), is_enqueue(false){}
+  void finish(Status s) override {
+    //RandomAccessFileReader::Read
+    if(!is_enqueue) {
+    //if(0) {
+      f_s = s;
+      is_enqueue = true; 
+      env->ScheduleAayncRead(this);
+      //ROCKS_LOG_INFO(myprint::print_info_log, "C_F_RW_OnFinish enqueue");
+    } else {
+      //ROCKS_LOG_INFO(myprint::print_info_log, "C_F_RW_OnFinish deal");
+      size_t r = 0;
+      assert(tmp.size() - offset_advance == len);
+      if (s.ok() && offset_advance < tmp.size()) {
+        aligned_buf.Size(tmp.size());
+        r = aligned_buf.Read(buf, offset_advance,
+                     std::min(tmp.size() - offset_advance, len));
+      }
+      *contents = Slice(buf, r);
+      //return s;
+      block_context->complete(s);
+    }
+  }
+};
+
+Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
+                                    char* scratch, Context* ctx) const {
+  Status s;
+  size_t alignment = file_->GetRequiredBufferAlignment();
+  size_t aligned_offset = TruncateToPageBoundary(alignment, offset);
+  size_t offset_advance = offset - aligned_offset;
+  size_t size = Roundup(offset + n, alignment) - aligned_offset;
+  size_t r = 0;
+  C_F_RW_OnFinish* file_ctx = new C_F_RW_OnFinish(scratch, result,
+                                    offset_advance, n, ctx, env_);
+  file_ctx->aligned_buf.Alignment(alignment);
+  file_ctx->aligned_buf.AllocateNewBuffer(size);
+  std::cout << __func__ << std::endl;
+  s = file_->AsyncRead(aligned_offset, size, &file_ctx->tmp, 
+                        file_ctx->aligned_buf.BufferStart(), file_ctx);
+  return s;
 }
 
 Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,

@@ -34,6 +34,7 @@
 #include "db/version_builder.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/env.h"
+#include "rocksdb/Context.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/format.h"
@@ -926,10 +927,166 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       refs_(0),
       version_number_(version_number) {}
 
+void Version::GetSearchAllSSTAfter(GetContext& get_context, Status* status) {
+  if (GetContext::kMerge == get_context.State()) {
+    if (!merge_operator_) {
+      *status =  Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      return;
+    }
+    // merge_operands are in saver and we hit the beginning of the key history
+    // do a final merge of nullptr and operands;
+    std::string* str_value = get_context.pinnable_val_ != nullptr ? get_context.pinnable_val_->GetSelf() : nullptr;
+    *status = MergeHelper::TimedFullMerge(
+        get_context.merge_operator_, get_context.user_key_, nullptr, get_context.merge_context_->GetOperands(),
+        str_value, info_log_, db_statistics_, env_);
+    if (LIKELY(get_context.pinnable_val_ != nullptr)) {
+      get_context.pinnable_val_->PinSelf();
+    }
+  } else {
+    *status = Status::NotFound(); // Use an empty error message for speed
+  }
+}
+// return done, if true is determinate
+bool Version::GetSearchAllSST(const ReadOptions& read_options, const LookupKey& k,
+                              GetContext& get_context, FilePicker& fp,
+                              Status* status) {
+  Slice ikey = k.internal_key();
+  Slice user_key = k.user_key();
+
+  FdWithKeyRange* f = fp.GetNextFile();
+  while (f != nullptr) {
+    *status = table_cache_->Get(
+        read_options, *internal_comparator(), f->fd, ikey, &get_context,
+        cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
+        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                        fp.IsHitFileLastInLevel()),
+        fp.GetCurrentLevel());
+    // TODO: examine the behavior for corrupted key
+    if (!status->ok()) {
+      return true;
+    }
+
+    switch (get_context.State()) {
+      case GetContext::kNotFound:
+        // Keep searching in other files
+        break;
+      case GetContext::kFound:
+        if (fp.GetHitFileLevel() == 0) {
+          RecordTick(db_statistics_, GET_HIT_L0);
+        } else if (fp.GetHitFileLevel() == 1) {
+          RecordTick(db_statistics_, GET_HIT_L1);
+        } else if (fp.GetHitFileLevel() >= 2) {
+          RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+        }
+        return true;
+      case GetContext::kDeleted:
+        // Use empty error message for speed
+        *status = Status::NotFound();
+        return true;
+      case GetContext::kCorrupt:
+        *status = Status::Corruption("corrupted key for ", user_key);
+        return true;
+      case GetContext::kMerge:
+        break;
+    }
+    f = fp.GetNextFile();
+  }
+  return false;
+}
+
+struct Version::C_Version_RW_OnFinish : Context {
+  Version* _v;
+  const ReadOptions read_options;
+  std::shared_ptr<const LookupKey> k;
+  std::shared_ptr<GetContext> get_context;
+  std::shared_ptr<FilePicker> fp;
+  //GetContext *get_context;
+  //FilePicker *fp;
+  Context *ctx;
+  C_Version_RW_OnFinish(Version* v, const ReadOptions& r_opt,
+                        std::shared_ptr<const LookupKey> key, 
+                        std::shared_ptr<GetContext> get_context_,
+                        std::shared_ptr<FilePicker> fp_, Context *ctx_) 
+                        : _v(v), read_options(r_opt), k(key),
+                          get_context(get_context_), fp(fp_), ctx(ctx_){}
+  //~C_Version_RW_OnFinish() {
+  //  if(fp) {
+  //    delete fp;
+  //    fp = nullptr;
+  //  }
+  //  if(get_context) {
+  //    delete get_context;
+  //    get_context = nullptr;
+  //  }
+  //}
+  void finish(Status status) override {
+repeat:
+    if (!status.ok()) {
+      //return;
+      ctx->complete(status);
+    } else {
+      bool done = false;
+      switch (get_context->State()) {
+        case GetContext::kNotFound:
+          // Keep searching in other files
+          break;
+        case GetContext::kFound:
+          if (fp->GetHitFileLevel() == 0) {
+            RecordTick(_v->db_statistics_, GET_HIT_L0);
+          } else if (fp->GetHitFileLevel() == 1) {
+            RecordTick(_v->db_statistics_, GET_HIT_L1);
+          } else if (fp->GetHitFileLevel() >= 2) {
+            RecordTick(_v->db_statistics_, GET_HIT_L2_AND_UP);
+          }
+          //return;
+          done = true;
+          break;  
+        case GetContext::kDeleted:
+          // Use empty error message for speed
+          status = Status::NotFound();
+          //return;
+          done = true;
+          break;
+        case GetContext::kCorrupt:
+          status = Status::Corruption("corrupted key for ", k->user_key());
+          //return;
+          done = true;
+          break;
+        case GetContext::kMerge:
+          break;
+      }
+      if(done) { //search cpmplete
+        //_v->GetSearchAllSSTAfter(*get_context, &status);
+        ctx->complete(status);
+      } else { //search for next sst
+        FdWithKeyRange* f = fp->GetNextFile();
+        if(f != nullptr) {
+          Slice ikey = k->internal_key();
+          status = _v->table_cache_->Get(
+                read_options, *_v->internal_comparator(), f->fd, ikey, get_context, this,
+                  _v->cfd_->internal_stats()->GetFileReadHist(fp->GetHitFileLevel()),
+                    _v->IsFilterSkipped(static_cast<int>(fp->GetHitFileLevel()),
+                        fp->IsHitFileLastInLevel()),                      
+                          fp->GetCurrentLevel());
+          if(status.IsAsyncRead()) {
+            return;
+          }
+          goto repeat;
+        } else {
+          _v->GetSearchAllSSTAfter(*get_context, &status);
+          ctx->complete(status);
+        }
+      }
+    }
+    delete this;
+  }
+};
+
 void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   PinnableSlice* value, Status* status,
                   MergeContext* merge_context,
-                  RangeDelAggregator* range_del_agg, bool* value_found,
+                  RangeDelAggregator* range_del_agg, bool* value_found, 
                   bool* key_exists, SequenceNumber* seq) {
   Slice ikey = k.internal_key();
   Slice user_key = k.user_key();
@@ -1017,6 +1174,112 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     *status = Status::NotFound(); // Use an empty error message for speed
   }
+}
+
+void Version::Get(const ReadOptions& read_options, 
+                  std::shared_ptr<const LookupKey> k,
+                  PinnableSlice* value, Status* status,
+                  MergeContext* merge_context,
+                  std::shared_ptr<RangeDelAggregator> range_del_agg, Context* ctx,
+                  bool* value_found, bool* key_exists,
+                  SequenceNumber* seq) {
+  Slice ikey = k->internal_key();
+  Slice user_key = k->user_key();
+
+  assert(status->ok() || status->IsMergeInProgress());
+
+  if (key_exists != nullptr) {
+    // will falsify below if not found
+    *key_exists = true;
+  }
+
+  PinnedIteratorsManager pinned_iters_mgr;
+  std::shared_ptr<GetContext> get_context(new GetContext(
+      user_comparator(), merge_operator_, info_log_, db_statistics_,
+      status->ok() ? GetContext::kNotFound : GetContext::kMerge, k->user_key(),
+      value, value_found, merge_context, range_del_agg.get(), this->env_, seq,
+      merge_operator_ ? &pinned_iters_mgr : nullptr));
+
+  // Pin blocks that we read to hold merge operands
+  if (merge_operator_) {
+    pinned_iters_mgr.StartPinning();
+  }
+
+  std::shared_ptr<FilePicker> fp(new FilePicker(
+      storage_info_.files_, user_key, ikey, &storage_info_.level_files_brief_,
+      storage_info_.num_non_empty_levels_, &storage_info_.file_indexer_,
+      user_comparator(), internal_comparator()));
+  C_Version_RW_OnFinish* version_ctx = new C_Version_RW_OnFinish(this, read_options,
+                                            k, get_context, fp, ctx);
+  FdWithKeyRange* f = fp->GetNextFile();
+  while (f != nullptr) {
+    *status = table_cache_->Get(
+        read_options, *internal_comparator(), f->fd, ikey, get_context, version_ctx,
+        cfd_->internal_stats()->GetFileReadHist(fp->GetHitFileLevel()),
+        IsFilterSkipped(static_cast<int>(fp->GetHitFileLevel()),
+                        fp->IsHitFileLastInLevel()),
+        fp->GetCurrentLevel());
+    if(status->IsAsyncRead()) {
+      return;
+    }
+    // TODO: examine the behavior for corrupted key
+    if (!status->ok()) {
+      return;
+    }
+
+    switch (get_context->State()) {
+      case GetContext::kNotFound:
+        // Keep searching in other files
+        break;
+      case GetContext::kFound:
+        if (fp->GetHitFileLevel() == 0) {
+          RecordTick(db_statistics_, GET_HIT_L0);
+        } else if (fp->GetHitFileLevel() == 1) {
+          RecordTick(db_statistics_, GET_HIT_L1);
+        } else if (fp->GetHitFileLevel() >= 2) {
+          RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+        }
+        return;
+      case GetContext::kDeleted:
+        // Use empty error message for speed
+        *status = Status::NotFound();
+        return;
+      case GetContext::kCorrupt:
+        *status = Status::Corruption("corrupted key for ", user_key);
+        return;
+      case GetContext::kMerge:
+        break;
+    }
+    f = fp->GetNextFile();
+  }
+
+  //all the data block in block cache, so we do not need version_ctx
+
+  if (GetContext::kMerge == get_context->State()) {
+    if (!merge_operator_) {
+      *status =  Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      version_ctx->ctx = nullptr;
+      delete version_ctx;
+      return;
+    }
+    // merge_operands are in saver and we hit the beginning of the key history
+    // do a final merge of nullptr and operands;
+    std::string* str_value = value != nullptr ? value->GetSelf() : nullptr;
+    *status = MergeHelper::TimedFullMerge(
+        merge_operator_, user_key, nullptr, merge_context->GetOperands(),
+        str_value, info_log_, db_statistics_, env_);
+    if (LIKELY(value != nullptr)) {
+      value->PinSelf();
+    }
+  } else {
+    if (key_exists != nullptr) {
+      *key_exists = false;
+    }
+    *status = Status::NotFound(); // Use an empty error message for speed
+  }
+  version_ctx->ctx = nullptr;
+  delete version_ctx;
 }
 
 bool Version::IsFilterSkipped(int level, bool is_file_last_in_level) {

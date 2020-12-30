@@ -139,6 +139,16 @@ class PosixEnv : public Env {
     if (this != Env::Default()) {
       delete thread_status_updater_;
     }
+
+    {
+      std::unique_lock<std::mutex> l(read_thread_lock);
+      while (!read_thread_start) {
+        read_cond.wait(l);
+      }
+      read_thread_stop = true;
+      read_cond.notify_all();
+    }
+    read_thread.join();
   }
 
   void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
@@ -609,6 +619,8 @@ class PosixEnv : public Env {
     return result;
   }
 
+  virtual void ScheduleAayncRead(Context* ctx) override;
+
   virtual void Schedule(void (*function)(void* arg1), void* arg,
                         Priority pri = LOW, void* tag = nullptr,
                         void (*unschedFunction)(void* arg) = 0) override;
@@ -837,11 +849,20 @@ class PosixEnv : public Env {
 #endif
   }
 
+  void _read_thread();
+
   size_t page_size_;
 
   std::vector<ThreadPoolImpl> thread_pools_;
   pthread_mutex_t mu_;
   std::vector<pthread_t> threads_to_join_;
+
+  std::thread read_thread;
+  bool read_thread_stop = false;
+  bool read_thread_start = false;
+  std::mutex read_thread_lock;
+  std::condition_variable read_cond;
+  std::deque<Context*> read_queue;
 };
 
 PosixEnv::PosixEnv()
@@ -857,7 +878,36 @@ PosixEnv::PosixEnv()
     thread_pools_[pool_id].SetHostEnv(this);
   }
   thread_status_updater_ = CreateThreadStatusUpdater();
+  
+  read_thread = std::thread{ &PosixEnv::_read_thread, this };
+  pthread_setname_np(read_thread.native_handle(), "rocksdb_read");
 }
+
+void PosixEnv::_read_thread() {
+  std::unique_lock<std::mutex> l(read_thread_lock);
+  read_thread_start = true;
+  read_cond.notify_all();
+  l.unlock();
+  while(read_thread_stop) {
+    if(read_queue.empty()) {
+      l.lock();
+      read_cond.wait(l);
+    }
+    std::deque<Context *> read_finish;
+    l.lock();
+    read_finish.swap(read_queue);
+    l.unlock();
+    for (auto ctx : read_finish) {
+      ctx->complete(ctx->f_s);
+    }
+  }
+}
+
+void PosixEnv::ScheduleAayncRead(Context* ctx) {
+  std::lock_guard<std::mutex> l(read_thread_lock);
+  read_queue.push_back(ctx);
+  read_cond.notify_one();
+}                                                                               
 
 void PosixEnv::Schedule(void (*function)(void* arg1), void* arg, Priority pri,
                         void* tag, void (*unschedFunction)(void* arg)) {

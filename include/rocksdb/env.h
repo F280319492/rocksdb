@@ -26,6 +26,7 @@
 #include <vector>
 #include "rocksdb/status.h"
 #include "rocksdb/thread_status.h"
+#include "rocksdb/Context.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -293,6 +294,7 @@ class Env {
     IO_TOTAL = 2
   };
 
+  virtual void ScheduleAayncRead(Context*) {}
   // Arrange to run "(*function)(arg)" once in a background thread, in
   // the thread pool specified by pri. By default, jobs go to the 'LOW'
   // priority thread pool.
@@ -504,6 +506,10 @@ class RandomAccessFile {
   // If Direct I/O enabled, offset, n, and scratch should be aligned properly.
   virtual Status Read(uint64_t offset, size_t n, Slice* result,
                       char* scratch) const = 0;
+  virtual Status AsyncRead(uint64_t offset, size_t n, Slice* result,
+                      char* scratch, Context* ctx) const {
+    return Status::NotSupported();
+  }
 
   // Readahead the file starting from offset by n bytes for caching.
   virtual Status Prefetch(uint64_t offset, size_t n) {
@@ -846,6 +852,12 @@ class Logger {
   InfoLogLevel log_level_;
 };
 
+class myprint{
+public:
+static Logger* print_info_log;
+static bool print_init;
+};
+
 
 // Identifies a locked file.
 class FileLock {
@@ -1000,6 +1012,9 @@ class EnvWrapper : public Env {
 
   Status UnlockFile(FileLock* l) override { return target_->UnlockFile(l); }
 
+  void ScheduleAayncRead(Context* ctx) override {
+    return target_->ScheduleAayncRead(ctx);
+  }
   void Schedule(void (*f)(void* arg), void* a, Priority pri,
                 void* tag = nullptr, void (*u)(void* arg) = 0) override {
     return target_->Schedule(f, a, pri, tag, u);

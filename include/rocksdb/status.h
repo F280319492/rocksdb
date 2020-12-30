@@ -58,7 +58,8 @@ class Status {
     kAborted = 10,
     kBusy = 11,
     kExpired = 12,
-    kTryAgain = 13
+    kTryAgain = 13,
+    kAsyncRead = 14
   };
 
   Code code() const { return code_; }
@@ -162,6 +163,11 @@ class Status {
     return Status(kTryAgain, msg, msg2);
   }
 
+  static Status AsyncRead(SubCode msg = kNone) { return Status(kAsyncRead, msg); }
+  static Status AsyncRead(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kAsyncRead, msg, msg2);
+  }
+
   static Status NoSpace() { return Status(kIOError, kNoSpace); }
   static Status NoSpace(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kIOError, kNoSpace, msg, msg2);
@@ -237,6 +243,9 @@ class Status {
     return (code() == kAborted) && (subcode() == kMemoryLimit);
   }
 
+  bool IsAsyncRead() const {
+    return code() == kAsyncRead;
+  }
   // Return a string representation of this status suitable for printing.
   // Returns the string "OK" for success.
   std::string ToString() const;

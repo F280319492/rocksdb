@@ -62,7 +62,9 @@ class MergeContext;
 class ColumnFamilySet;
 class TableCache;
 class MergeIteratorBuilder;
-
+namespace {
+class FilePicker;
+}
 // Return the smallest index i such that file_level.files[i]->largest >= key.
 // Return file_level.num_files if there is no such file.
 // REQUIRES: "file_level.files" contains a sorted list of
@@ -453,6 +455,7 @@ class Version {
   // Append to *iters a sequence of iterators that will
   // yield the contents of this Version when merged together.
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
+  class C_Version_RW_OnFinish;
   void AddIterators(const ReadOptions&, const EnvOptions& soptions,
                     MergeIteratorBuilder* merger_iter_builder,
                     RangeDelAggregator* range_del_agg);
@@ -477,10 +480,22 @@ class Version {
   // for the key if a key was found.
   //
   // REQUIRES: lock is not held
+  bool GetSearchAllSST(const ReadOptions& read_options, const LookupKey& k,
+                       GetContext& get_context, FilePicker& fp,
+                       Status* status);
+  void GetSearchAllSSTAfter(GetContext& get_context, Status* status);
+
   void Get(const ReadOptions&, const LookupKey& key, PinnableSlice* value,
            Status* status, MergeContext* merge_context,
            RangeDelAggregator* range_del_agg, bool* value_found = nullptr,
            bool* key_exists = nullptr, SequenceNumber* seq = nullptr);
+
+    void Get(const ReadOptions&, std::shared_ptr<const LookupKey> key, 
+             PinnableSlice* value,
+           Status* status, MergeContext* merge_context,
+           std::shared_ptr<RangeDelAggregator> range_del_agg, Context* ctx, 
+           bool* value_found = nullptr, bool* key_exists = nullptr,
+           SequenceNumber* seq = nullptr);
 
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
@@ -583,10 +598,12 @@ class Version {
   // first.
   void UpdateFilesByCompactionPri();
 
+protected:
   ColumnFamilyData* cfd_;  // ColumnFamilyData to which this Version belongs
   Logger* info_log_;
   Statistics* db_statistics_;
   TableCache* table_cache_;
+private:
   const MergeOperator* merge_operator_;
 
   VersionStorageInfo storage_info_;

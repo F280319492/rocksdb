@@ -15,6 +15,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
 #include "rocksdb/env.h"
+#include "rocksdb/Context.h"
 #include "table/block.h"
 #include "table/block_based_table_reader.h"
 #include "table/persistent_cache_helper.h"
@@ -249,12 +250,178 @@ Status ReadFooterFromFile(RandomAccessFileReader* file, uint64_t file_size,
   return Status::OK();
 }
 
+Status ReadBlockCallBack(const ReadOptions& options, Slice* contents,
+                         const Footer& footer, int n, Status& s) {
+  if (!s.ok()) {
+    return s;
+  }
+  if (contents->size() != n + kBlockTrailerSize) {
+    return Status::Corruption("truncated block read");
+  }
+
+  // Check the crc of the type and the block contents
+  const char* data = contents->data();  // Pointer to where Read put the data
+  if (options.verify_checksums) {
+    PERF_TIMER_GUARD(block_checksum_time);
+    uint32_t value = DecodeFixed32(data + n + 1);
+    uint32_t actual = 0;
+    switch (footer.checksum()) {
+      case kCRC32c:
+        value = crc32c::Unmask(value);
+        actual = crc32c::Value(data, n + 1);
+        break;
+      case kxxHash:
+        actual = XXH32(data, static_cast<int>(n) + 1, 0);
+        break;
+      default:
+        s = Status::Corruption("unknown checksum type");
+    }
+    if (s.ok() && actual != value) {
+      s = Status::Corruption("block checksum mismatch");
+    }
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return s;
+}
+
+Status ReadBlockContentsCallBack(const Footer& footer, Status status,
+                                  char* used_buf, Slice& slice,
+                                  const ReadOptions& read_options,
+                                  const BlockHandle& handle, BlockContents* contents,
+                                  const ImmutableCFOptions &ioptions,
+                                  bool decompression_requested,
+                                  const Slice& compression_dict
+                                 ) {
+  //ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContentsCallBack %s", status.ToString().c_str());
+  //we do not use PersistentCache
+  if (!status.ok()) {
+    return status;
+  }
+
+  PERF_TIMER_GUARD(block_decompress_time);
+
+  size_t n = static_cast<size_t>(handle.size());
+  rocksdb::CompressionType compression_type = static_cast<rocksdb::CompressionType>(slice.data()[n]);
+
+  if (decompression_requested && compression_type != kNoCompression) {
+    // compressed page, uncompress, update cache
+    //ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContentsCallBack 0");
+    status = UncompressBlockContents(slice.data(), n, contents,
+                                     footer.version(), compression_dict,
+                                     ioptions);
+  } else if (slice.data() != used_buf) {
+    // the slice content is not the buffer provided
+    ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContentsCallBack 1");
+    *contents = BlockContents(Slice(slice.data(), n), false, compression_type);
+  } else {
+    // page is uncompressed, the buffer either stack or heap provided
+    //ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContentsCallBack 2.2 %d %d", n, compression_type);
+    *contents = BlockContents(Slice(used_buf, n), true, compression_type);
+    //ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContentsCallBack 2.3 %d", n);
+  }
+
+  return status;
+}
 // Without anonymous namespace here, we fail the warning -Wmissing-prototypes
-namespace {
+//namespace {
+void PrintBuffer(const ImmutableCFOptions &ioptions, const void* pBuff, unsigned int nLen)
+{
+    if (NULL == pBuff || 0 == nLen) {
+        return;
+    }
+
+    const int nBytePerLine = 16;
+    unsigned char* p = (unsigned char*)pBuff;
+    char szHex[3*nBytePerLine+1] = {0};
+
+    ROCKS_LOG_INFO(ioptions.info_log, "-----------------begin-------------------");
+    for (unsigned int i=0; i<nLen; ++i) {
+        int idx = 3 * (i % nBytePerLine);
+        if (0 == idx) {
+            memset(szHex, 0, sizeof(szHex));
+        }
+        snprintf(&szHex[idx], 4, "%02x ", p[i]); // buff长度要多传入1个字节
+        
+        // 以16个字节为一行，进行打印
+        if (0 == ((i+1) % nBytePerLine)) {
+            ROCKS_LOG_INFO(ioptions.info_log,"%s", szHex);
+        }
+    }
+
+    // 打印最后一行未满16个字节的内容
+    if (0 != (nLen % nBytePerLine)) {
+        ROCKS_LOG_INFO(ioptions.info_log,"%s\n", szHex);
+    }
+    ROCKS_LOG_INFO(ioptions.info_log,"------------------end-------------------\n");
+}
+
+struct C_Block_RW_OnFinish : Context {
+  const ReadOptions& options;
+  Slice contents;
+  const Footer& footer;
+  char* used_buf;
+  const ImmutableCFOptions &ioptions;
+  bool decompression_requested;
+  const Slice& compression_dict;
+  const BlockHandle handle;
+  BlockContents *block_contents;
+
+  Context* sst_ctx;
+
+  C_Block_RW_OnFinish(const ReadOptions& opt, const Footer& footer_,
+                      const ImmutableCFOptions &iopt,
+                      bool decompression_req, const Slice& compress_dict,
+                      const BlockHandle& h, BlockContents *block_contents_, Context* ctx) :
+                          options(opt), footer(footer_), ioptions(iopt),
+                          decompression_requested(decompression_req), 
+                          compression_dict(compress_dict), handle(h),
+                          block_contents(block_contents_),sst_ctx(ctx){
+                            used_buf = nullptr;
+                          }
+  ~C_Block_RW_OnFinish() {
+    if(used_buf) {
+      delete used_buf;
+      used_buf = nullptr;
+    }
+  }
+  void finish(Status status) override {
+    size_t len = static_cast<size_t>(handle.size());
+    Status s = ReadBlockCallBack(options, &contents, footer, len, status);
+    if(!s.ok()) {
+      PrintBuffer(ioptions, contents.data(), len + kBlockTrailerSize);
+      ROCKS_LOG_INFO(ioptions.info_log, "C_Block_RW_OnFinish finish, Status:%s, contents:%d, len:%d",
+                     s.ToString().c_str(), contents.size(), len);
+    }
+    s = ReadBlockContentsCallBack(footer, s, used_buf, contents, options,
+                                  handle, block_contents, ioptions, decompression_requested,
+                                  compression_dict);
+    //sst_ctx->complete(s);
+    sst_ctx->complete_without_del(s);
+  }
+};
 
 // Read a block and check its CRC
 // contents is the result of reading.
 // According to the implementation of file->Read, contents may not point to buf
+Status ReadBlock(RandomAccessFileReader* file, const Footer& footer,
+                 const ReadOptions& options, const BlockHandle& handle,
+                 Context* ctx,
+                 Slice* contents, /* result of reading */ char* buf) {
+  size_t n = static_cast<size_t>(handle.size());
+  Status s;
+
+  {
+    PERF_TIMER_GUARD(block_read_time);
+    s = file->Read(handle.offset(), n + kBlockTrailerSize, contents, buf, ctx);
+  }
+
+  PERF_COUNTER_ADD(block_read_count, 1);
+  PERF_COUNTER_ADD(block_read_byte, n + kBlockTrailerSize);
+  return s;
+}
+
 Status ReadBlock(RandomAccessFileReader* file, const Footer& footer,
                  const ReadOptions& options, const BlockHandle& handle,
                  Slice* contents, /* result of reading */ char* buf) {
@@ -303,7 +470,29 @@ Status ReadBlock(RandomAccessFileReader* file, const Footer& footer,
   return s;
 }
 
-}  // namespace
+Status ReadBlockContents(RandomAccessFileReader* file, const Footer& footer,  
+                         const ReadOptions& read_options, Context* ctx,
+                         const BlockHandle& handle, BlockContents* contents,
+                         const ImmutableCFOptions &ioptions,
+                         bool decompression_requested,
+                         const Slice& compression_dict) {
+
+  C_Block_RW_OnFinish* block_ctx = new C_Block_RW_OnFinish(
+      read_options, footer, ioptions, decompression_requested,
+      compression_dict, handle, contents, ctx);
+  //ROCKS_LOG_INFO(ioptions.info_log,"ReadBlockContents  %p", block_ctx);
+  //ROCKS_LOG_INFO(ioptions.info_log, "ReadBlockContents %d", file->use_direct_io());
+  Status status;
+  size_t n = static_cast<size_t>(handle.size());
+
+  block_ctx->used_buf = new char[n + kBlockTrailerSize];
+
+  status = ReadBlock(file, footer, read_options, handle, block_ctx,
+                     &block_ctx->contents, block_ctx->used_buf);
+
+  return status;
+}
+
 
 Status ReadBlockContents(RandomAccessFileReader* file, const Footer& footer,
                          const ReadOptions& read_options,
@@ -320,64 +509,18 @@ Status ReadBlockContents(RandomAccessFileReader* file, const Footer& footer,
   char* used_buf = nullptr;
   rocksdb::CompressionType compression_type;
 
-  if (cache_options.persistent_cache &&
-      !cache_options.persistent_cache->IsCompressed()) {
-    status = PersistentCacheHelper::LookupUncompressedPage(cache_options,
-                                                           handle, contents);
-    if (status.ok()) {
-      // uncompressed page is found for the block handle
-      return status;
-    } else {
-      // uncompressed page is not found
-      if (ioptions.info_log && !status.IsNotFound()) {
-        assert(!status.ok());
-        ROCKS_LOG_INFO(ioptions.info_log,
-                       "Error reading from persistent cache. %s",
-                       status.ToString().c_str());
-      }
-    }
-  }
-
-  if (cache_options.persistent_cache &&
-      cache_options.persistent_cache->IsCompressed()) {
-    // lookup uncompressed cache mode p-cache
-    status = PersistentCacheHelper::LookupRawPage(
-        cache_options, handle, &heap_buf, n + kBlockTrailerSize);
+  // cache miss read from device
+  if (decompression_requested &&
+      n + kBlockTrailerSize < DefaultStackBufferSize) {
+    // If we've got a small enough hunk of data, read it in to the
+    // trivially allocated stack buffer instead of needing a full malloc()
+    used_buf = &stack_buf[0];
   } else {
-    status = Status::NotFound();
-  }
-
-  if (status.ok()) {
-    // cache hit
+    heap_buf = std::unique_ptr<char[]>(new char[n + kBlockTrailerSize]);
     used_buf = heap_buf.get();
-    slice = Slice(heap_buf.get(), n);
-  } else {
-    if (ioptions.info_log && !status.IsNotFound()) {
-      assert(!status.ok());
-      ROCKS_LOG_INFO(ioptions.info_log,
-                     "Error reading from persistent cache. %s",
-                     status.ToString().c_str());
-    }
-    // cache miss read from device
-    if (decompression_requested &&
-        n + kBlockTrailerSize < DefaultStackBufferSize) {
-      // If we've got a small enough hunk of data, read it in to the
-      // trivially allocated stack buffer instead of needing a full malloc()
-      used_buf = &stack_buf[0];
-    } else {
-      heap_buf = std::unique_ptr<char[]>(new char[n + kBlockTrailerSize]);
-      used_buf = heap_buf.get();
-    }
-
-    status = ReadBlock(file, footer, read_options, handle, &slice, used_buf);
-    if (status.ok() && read_options.fill_cache &&
-        cache_options.persistent_cache &&
-        cache_options.persistent_cache->IsCompressed()) {
-      // insert to raw cache
-      PersistentCacheHelper::InsertRawPage(cache_options, handle, used_buf,
-                                           n + kBlockTrailerSize);
-    }
   }
+
+  status = ReadBlock(file, footer, read_options, handle, &slice, used_buf);
 
   if (!status.ok()) {
     return status;
@@ -402,14 +545,6 @@ Status ReadBlockContents(RandomAccessFileReader* file, const Footer& footer,
       memcpy(heap_buf.get(), stack_buf, n);
     }
     *contents = BlockContents(std::move(heap_buf), n, true, compression_type);
-  }
-
-  if (status.ok() && read_options.fill_cache &&
-      cache_options.persistent_cache &&
-      !cache_options.persistent_cache->IsCompressed()) {
-    // insert to uncompressed cache
-    PersistentCacheHelper::InsertUncompressedPage(cache_options, handle,
-                                                  *contents);
   }
 
   return status;

@@ -60,13 +60,14 @@ class GetContext {
   // Do we need to fetch the SequenceNumber for this key?
   bool NeedToReadSequence() const { return (seq_ != nullptr); }
 
- private:
+ //private:
   const Comparator* ucmp_;
   const MergeOperator* merge_operator_;
   // the merge operations encountered;
   Logger* logger_;
   Statistics* statistics_;
 
+  public:
   GetState state_;
   Slice user_key_;
   PinnableSlice* pinnable_val_;
